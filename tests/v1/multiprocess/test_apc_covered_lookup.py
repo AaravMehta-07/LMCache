@@ -27,6 +27,24 @@ from lmcache.v1.multiprocess.modules.lookup import resolve_prefetched_obj_keys
 CHUNK_SIZE = 16
 
 
+class _FakeRequest:
+    """Duck-typed vLLM Request carrying only what the tracker reads."""
+
+    def __init__(self, prompt_token_ids: list[int]):
+        # Third Party
+        from vllm.v1.request import RequestStatus
+
+        self.request_id = "req-covered"
+        self.status = RequestStatus.WAITING
+        self.cache_salt = ""
+        self.prompt_token_ids = list(prompt_token_ids)
+        self.num_prompt_tokens = len(prompt_token_ids)
+        self.all_token_ids = list(prompt_token_ids)
+        self.num_computed_tokens = 0
+        self.mm_features = []
+        self.sampling_params = None
+
+
 def _make_key(n_chunks: int, covered_chunks: int = 0) -> IPCCacheServerKey:
     n_tokens = n_chunks * CHUNK_SIZE
     request_configs = (
@@ -157,3 +175,82 @@ def test_touch_cached_keys_hits_both_tiers():
     sm.touch_l1_keys.assert_called_once_with(keys)
     l2_a.touch_keys.assert_called_once_with(keys)
     l2_b.touch_keys.assert_called_once_with(keys)
+
+
+def test_submit_returns_clamped_covered_and_none_when_already_pending():
+    """``maybe_submit_lookup_request`` reports what the server actually got.
+
+    The caller must key its frozen covered boundary off the return value: a
+    poll that no-ops because a lookup is already in flight returns ``None``,
+    and a submitted lookup returns the count after clamping to the aligned
+    range -- not the count the caller passed in.
+    """
+    # First Party
+    from lmcache.integration.vllm.vllm_multi_process_adapter import (
+        LMCacheMPSchedulerAdapter,
+    )
+
+    adapter = MagicMock(spec=LMCacheMPSchedulerAdapter)
+    adapter.is_healthy = True
+    adapter.lmcache_tokens_per_chunk = CHUNK_SIZE
+    adapter.tp_size = 1
+    adapter._pending_lookups = set()
+    adapter._unacked_lookups = {}
+    adapter._lookup_params = {}
+    adapter._server_urls = ["u"]
+    adapter.req_clients = {"u": MagicMock()}
+    adapter._create_key = MagicMock()
+    adapter._ensure_heartbeat_started = MagicMock()
+
+    submit = LMCacheMPSchedulerAdapter.maybe_submit_lookup_request
+    # 8 chunks of tokens, but ask for 99 covered chunks -> clamped to 8.
+    sent = submit(
+        adapter, "req", token_ids=list(range(8 * CHUNK_SIZE)), covered_chunks=99
+    )
+    assert sent == 8
+
+    # Second poll: the request is still pending, so nothing is sent.
+    assert (
+        submit(adapter, "req", token_ids=list(range(8 * CHUNK_SIZE)), covered_chunks=3)
+        is None
+    )
+
+
+def test_covered_boundary_frozen_only_when_a_lookup_is_sent():
+    """A no-op poll must not move ``lookup_covered_tokens``.
+
+    ``lookup_started_at`` is cleared once a result lands while the request
+    stays in ``_pending_lookups``, so a later poll re-enters the submit path.
+    If that poll re-froze the boundary from the APC hit it happens to see,
+    the frozen value would diverge from the one the in-flight lookup used --
+    making the shrink check compare against a boundary the server never had.
+    """
+    # First Party
+    from lmcache.integration.vllm.lmcache_mp_connector import LMCacheMPConnector
+
+    adapter = MagicMock()
+    adapter.lmcache_tokens_per_chunk = CHUNK_SIZE
+    # A lookup is already in flight, so the adapter sends nothing.
+    adapter.maybe_submit_lookup_request.return_value = None
+    adapter.check_lookup_result.return_value = None
+
+    connector = LMCacheMPConnector.__new__(LMCacheMPConnector)
+    connector.request_trackers = {}
+    connector.scheduler_adapter = adapter
+    connector._reserve_last_token_for_lookup = False
+    connector._hit_alignment_tokens = CHUNK_SIZE
+    connector._connector_stats = MagicMock()
+    connector.lazy_offload = False
+    connector._skip_covered_lookup = True
+
+    request = _FakeRequest(list(range(8 * CHUNK_SIZE)))
+    tracker = connector._get_or_create_request_tracker(request)
+    # The in-flight lookup was built on a 4-chunk APC hit.
+    tracker.lookup_covered_tokens = 4 * CHUNK_SIZE
+    tracker.lookup_started_at = None  # cleared when the previous result landed
+
+    # Poll again while a 7-chunk APC hit is visible. Before the fix this
+    # re-froze the boundary to 7 chunks even though no LOOKUP went out.
+    connector.get_num_new_matched_tokens(request, 7 * CHUNK_SIZE)
+
+    assert tracker.lookup_covered_tokens == 4 * CHUNK_SIZE

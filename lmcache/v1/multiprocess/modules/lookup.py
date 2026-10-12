@@ -652,6 +652,10 @@ class LookupModule:
                 metadata={
                     "found_count": found_count,
                     "requested_tokens": job.requested_tokens,
+                    # Leading chunks the engine already had, folded into the
+                    # *_tokens counts but absent from the *_keys counts, which
+                    # only cover the sub-range this prefetch actually ran.
+                    "covered_chunks": job.covered_chunks,
                     "hit_tokens": found_count * self._ctx.chunk_size,
                     "l1_hit_tokens": l1_chunks * self._ctx.chunk_size,
                     "l2_hit_tokens": l2_chunks * self._ctx.chunk_size,

@@ -819,7 +819,7 @@ class LMCacheMPSchedulerAdapter:
         request_configs: dict[str, Any] | None = None,
         reserve_last_token: bool = False,
         covered_chunks: int = 0,
-    ) -> None:
+    ) -> int | None:
         """
         Submit a new lookup request to LMCache if there is no ongoing request.
 
@@ -842,7 +842,11 @@ class LMCacheMPSchedulerAdapter:
                 prefetch them. 0 disables the optimization for this request.
 
         Returns:
-            None
+            The ``covered_chunks`` actually sent, clamped to the aligned lookup
+            range, or ``None`` when no LOOKUP was sent (unhealthy, or one is
+            already in flight). Callers must key any per-lookup state off this
+            value rather than off what they passed in, so their view of the
+            covered boundary cannot drift from the server's.
 
         Notes:
             This function will have a side-effect: submitting a look up request to
@@ -854,11 +858,11 @@ class LMCacheMPSchedulerAdapter:
         self._ensure_heartbeat_started()
 
         if not self.is_healthy:
-            return
+            return None
 
         if request_id in self._pending_lookups:
             # Skip if there is already a lookup request
-            return
+            return None
 
         lookup_tokens = max(0, len(token_ids) - int(reserve_last_token))
         aligned_end = (
@@ -898,6 +902,7 @@ class LMCacheMPSchedulerAdapter:
         )
         self._pending_lookups.add(request_id)
         self._lookup_params[request_id] = (token_ids, cache_salt, request_configs)
+        return covered_chunks
 
     def _free_inconsistent_lookup_locks(
         self,

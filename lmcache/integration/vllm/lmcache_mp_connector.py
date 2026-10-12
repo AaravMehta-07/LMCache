@@ -1336,11 +1336,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
 
         if tracker.lookup_started_at is None:
             tracker.lookup_started_at = time.monotonic()
-            # Freeze the covered boundary at submit; the shrink hook keys off it.
-            tracker.lookup_covered_tokens = (
-                covered_chunks * self.scheduler_adapter.lmcache_tokens_per_chunk
-            )
-        self.scheduler_adapter.maybe_submit_lookup_request(
+        sent_covered = self.scheduler_adapter.maybe_submit_lookup_request(
             request.request_id,
             token_ids=tracker.get_token_ids(),
             cache_salt=tracker.cache_salt,
@@ -1348,6 +1344,15 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             reserve_last_token=self._reserve_last_token_for_lookup,
             covered_chunks=covered_chunks,
         )
+        # Freeze the boundary only when a LOOKUP really went out, and to the
+        # count the server received. A poll that no-ops (one already in flight)
+        # must not re-freeze: the APC hit it reads may differ from the one the
+        # live lookup was built on, which would make the shrink check compare
+        # against the wrong boundary and misjudge which locks are held.
+        if sent_covered is not None:
+            tracker.lookup_covered_tokens = (
+                sent_covered * self.scheduler_adapter.lmcache_tokens_per_chunk
+            )
 
         ret = self.scheduler_adapter.check_lookup_result(request.request_id)
         if ret is None:
