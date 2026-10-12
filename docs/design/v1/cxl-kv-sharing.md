@@ -128,8 +128,9 @@ Reserve `alignment + payload_size` bytes per slab: two 2-GiB payloads with
 2-MiB headers start at 0 and 2149580800 and need 4299161600 shared bytes.
 Deployment assigns non-overlapping slabs and must not reinitialize them with
 active readers. Device paths may differ between nodes.
-The shared API does not enable concurrent RDMA/CXL discovery or multiple L1
-managers; those still require the separate routing integration.
+The shared API does not enable concurrent RDMA/CXL discovery. With multiple L1
+managers, only the primary L1 exports a slab, and `add_cxl_peer` pins the peer
+adapter's `affinity_tag` to that L1 so borrowed shadows are admitted there.
 
 Tests cover distinct mappings of one shared file, ZMQ/gRPC, GPU copies when
 available, a full borrower slab, independent borrows, duplicate admission,

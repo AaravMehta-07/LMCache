@@ -14,7 +14,7 @@ import uuid
 import torch
 
 # First Party
-from lmcache.utils import _lmcache_nvtx_annotate, get_size_bytes
+from lmcache.utils import _lmcache_nvtx_annotate, get_device_identity, get_size_bytes
 from lmcache.v1.distributed.internal_api import CxlArenaDescriptor
 from lmcache.v1.memory_allocators.buffer_allocator import BufferAllocator
 from lmcache.v1.memory_allocators.mixed_memory_allocator import MixedMemoryAllocator
@@ -32,10 +32,12 @@ import lmcache.v1.memory_management as memory_management
 
 def _open_devdax_mapping(
     device_path: str, size: int, offset: int = 0
-) -> tuple[mmap.mmap, torch.Tensor]:
+) -> tuple[mmap.mmap, torch.Tensor, tuple[bool, int, int] | None]:
     """Map ``size`` bytes at aligned ``offset`` in a shared device/file.
 
-    Returns the mapping and its byte tensor. Live tensor views prevent unmapping.
+    Returns the mapping, its byte tensor, and the mapped file's
+    :func:`get_device_identity` (read from the open fd, so later path changes
+    cannot alias it). Live tensor views prevent unmapping.
     Raises RuntimeError for insufficient capacity, or OSError on open/map failure.
     """
     with open(device_path, "r+b", buffering=0) as device, ExitStack() as cleanup:
@@ -55,8 +57,9 @@ def _open_devdax_mapping(
             )
         )
         buffer = torch.frombuffer(memoryview(mapping), dtype=torch.uint8)
+        identity = get_device_identity(device.fileno())
         cleanup.pop_all()
-        return mapping, buffer
+        return mapping, buffer, identity
 
 
 class CxlPeerMapping:
@@ -75,7 +78,7 @@ class CxlPeerMapping:
     def __init__(self, device_path: str, arena: CxlArenaDescriptor) -> None:
         self.arena = arena
         self._fingerprint = arena.fingerprint()
-        self._mapping, buffer = _open_devdax_mapping(
+        self._mapping, buffer, _ = _open_devdax_mapping(
             device_path, arena.alignment + arena.size, arena.offset
         )
         self._buffer = buffer[arena.alignment :]
@@ -133,6 +136,10 @@ class CxlPeerMapping:
         self._buffer = torch.empty(0, dtype=torch.uint8)
         self._mapping.close()
         self._closed = True
+
+
+class DevDaxNotMappedError(ValueError):
+    """No Device-DAX arena is registered at the requested path."""
 
 
 class DevDaxArenaState(Enum):
@@ -204,6 +211,7 @@ class _DevDaxArena:
     buffer: torch.Tensor
     allocator: TensorMemoryAllocator
     is_primary: bool
+    device_identity: tuple[bool, int, int] | None
     state: DevDaxArenaState = DevDaxArenaState.ACTIVE
     pinned_ptr: int | None = None
     # Captured at map time so ``contains`` stays correct after a deferred
@@ -268,6 +276,7 @@ class DevDaxMemoryAllocator(MemoryAllocatorInterface):
         align_bytes: int = AddressManager.ALIGN_BYTES,
         pool_id: str = "",
         pool_offset: int = 0,
+        use_hugepages: bool = False,
     ) -> None:
         if not device_path:
             raise ValueError("device_path must be a non-empty string")
@@ -300,6 +309,7 @@ class DevDaxMemoryAllocator(MemoryAllocatorInterface):
                 local_size,
                 align_bytes=self.align_bytes,
                 shm_name=shm_name,
+                use_hugepages=use_hugepages,
             )
         self.host_mem_lock = threading.Lock()
         self.buffer_allocator = BufferAllocator("cpu")
@@ -375,7 +385,7 @@ class DevDaxMemoryAllocator(MemoryAllocatorInterface):
             OSError: If the device cannot be opened or mapped.
         """
         descriptor = self.cxl_arena if not self._arenas else None
-        mmap_obj, buffer = _open_devdax_mapping(
+        mmap_obj, buffer, device_identity = _open_devdax_mapping(
             device_path,
             size + (descriptor.alignment if descriptor else 0),
             descriptor.offset if descriptor else 0,
@@ -393,6 +403,7 @@ class DevDaxMemoryAllocator(MemoryAllocatorInterface):
                 buffer=buffer,
                 allocator=allocator,
                 is_primary=is_primary,
+                device_identity=device_identity,
             )
             self._register_arena_pin(arena)
         except Exception:
@@ -449,12 +460,12 @@ class DevDaxMemoryAllocator(MemoryAllocatorInterface):
         """Return the arena mapped at ``device_path``. Caller holds the lock.
 
         Raises:
-            ValueError: If no arena is mapped at ``device_path``.
+            DevDaxNotMappedError: If no arena is mapped at ``device_path``.
         """
         for arena in self._arenas:
             if arena.device_path == device_path:
                 return arena
-        raise ValueError(f"no Device-DAX arena mapped at {device_path}")
+        raise DevDaxNotMappedError(f"no Device-DAX arena mapped at {device_path}")
 
     def _arena_for_obj_locked(self, memory_obj: MemoryObj) -> _DevDaxArena:
         """Return the arena that owns ``memory_obj``. Caller holds the lock.
@@ -809,6 +820,26 @@ class DevDaxMemoryAllocator(MemoryAllocatorInterface):
         else:
             raise ValueError(f"Unsupported memory format: {fmt}")
 
+    def owns_device(self, device_path: str) -> bool:
+        """Return whether an arena maps the physical device at a path.
+
+        Args:
+            device_path: Candidate device path or alias.
+
+        Returns:
+            ``True`` if a retained arena's device identity matches, regardless
+            of its state.
+            Invalid, missing, or unsupported paths return ``False``.
+        """
+        requested_identity = get_device_identity(device_path)
+        if requested_identity is None:
+            return False
+        with self.host_mem_lock:
+            for arena in self._arenas:
+                if arena.device_identity == requested_identity:
+                    return True
+        return False
+
     def add_device(self, device_path: str, size_in_bytes: int) -> DevDaxArenaStatus:
         """Map an additional Device-DAX device and add it to the pool.
 
@@ -824,7 +855,7 @@ class DevDaxMemoryAllocator(MemoryAllocatorInterface):
             The status of the newly added arena.
 
         Raises:
-            ValueError: If ``device_path`` is empty, ``size_in_bytes`` is not
+            ValueError: If ``device_path`` is invalid, ``size_in_bytes`` is not
                 positive, or the device is already mapped.
             RuntimeError: If the allocator is closed or the device capacity is
                 smaller than ``size_in_bytes``.
@@ -834,13 +865,20 @@ class DevDaxMemoryAllocator(MemoryAllocatorInterface):
             raise ValueError("device_path must be a non-empty string")
         if size_in_bytes <= 0:
             raise ValueError("size_in_bytes must be > 0")
+        requested_identity = get_device_identity(device_path)
+        if requested_identity is None:
+            raise ValueError("failed to identify DAX device")
+
         with self.host_mem_lock:
             if self._unregistered:
                 raise RuntimeError(
                     "cannot add a device to a closed DevDaxMemoryAllocator"
                 )
             for arena in self._arenas:
-                if arena.device_path == device_path:
+                if (
+                    arena.device_path == device_path
+                    or arena.device_identity == requested_identity
+                ):
                     raise ValueError(
                         f"Device-DAX arena {device_path} is already mapped"
                     )
@@ -889,6 +927,32 @@ class DevDaxMemoryAllocator(MemoryAllocatorInterface):
         """Return a status snapshot of every arena currently in the pool."""
         with self.host_mem_lock:
             return [arena.status() for arena in self._arenas]
+
+    def arena_status(self, device_path: str) -> DevDaxArenaStatus:
+        """Return the status of the arena registered at ``device_path``.
+
+        Args:
+            device_path: The exact path used when the arena was added.
+
+        Returns:
+            The arena's current status.
+
+        Raises:
+            DevDaxNotMappedError: If no arena is registered at the path.
+        """
+        with self.host_mem_lock:
+            return self._find_arena_locked(device_path).status()
+
+    def memory_region_count(self) -> int:
+        """Return the number of memory regions backing this allocator.
+
+        Returns:
+            One for the local DRAM region, if present, plus one per mapped
+            Device-DAX arena, including draining arenas.
+        """
+        with self.host_mem_lock:
+            arena_count = len(self._arenas)
+        return (1 if self.local_allocator is not None else 0) + arena_count
 
     def memcheck(self) -> bool:
         local_ok = True
