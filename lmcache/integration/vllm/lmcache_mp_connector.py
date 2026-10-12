@@ -1349,7 +1349,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         # must not re-freeze: the APC hit it reads may differ from the one the
         # live lookup was built on, which would make the shrink check compare
         # against the wrong boundary and misjudge which locks are held.
-        if sent_covered is not None:
+        if self._skip_covered_lookup and sent_covered is not None:
             tracker.lookup_covered_tokens = (
                 sent_covered * self.scheduler_adapter.lmcache_tokens_per_chunk
             )
