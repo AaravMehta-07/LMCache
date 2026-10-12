@@ -13,6 +13,7 @@ backend:
 """
 
 # Standard
+from typing import Any
 from unittest.mock import MagicMock
 import threading
 
@@ -41,7 +42,7 @@ class _FakeRequest:
         self.num_prompt_tokens = len(prompt_token_ids)
         self.all_token_ids = list(prompt_token_ids)
         self.num_computed_tokens = 0
-        self.mm_features = []
+        self.mm_features: list[Any] = []
         self.sampling_params = None
 
 
