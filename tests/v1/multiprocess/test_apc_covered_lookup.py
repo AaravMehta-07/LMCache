@@ -13,7 +13,7 @@ backend:
 """
 
 # Standard
-from typing import Any
+from typing import Any, cast
 from unittest.mock import MagicMock
 import threading
 
@@ -255,3 +255,97 @@ def test_covered_boundary_frozen_only_when_a_lookup_is_sent():
     connector.get_num_new_matched_tokens(request, 7 * CHUNK_SIZE)
 
     assert tracker.lookup_covered_tokens == 4 * CHUNK_SIZE
+
+
+def _shrink_connector(skip_enabled: bool = True):
+    """A connector wired just enough to drive ``_handle_covered_shrink``."""
+    # First Party
+    from lmcache.integration.vllm.lmcache_mp_connector import LMCacheMPConnector
+    from lmcache.integration.vllm.lmcache_mp_metadata import LMCacheMPRequestTracker
+
+    adapter = MagicMock()
+    adapter.lmcache_tokens_per_chunk = CHUNK_SIZE
+    connector = LMCacheMPConnector.__new__(LMCacheMPConnector)
+    connector.scheduler_adapter = adapter
+    connector._skip_covered_lookup = skip_enabled
+
+    request = _FakeRequest(list(range(8 * CHUNK_SIZE)))
+    # _FakeRequest is duck-typed, not a vllm Request subclass.
+    tracker = LMCacheMPRequestTracker(cast(Any, request))
+    return LMCacheMPConnector, connector, adapter, request, tracker
+
+
+def test_shrink_frees_stale_locks_blocking_and_goes_sticky():
+    """A shrink must release the stale locks and never skip again.
+
+    The replacement lookup re-locks the overlap, so the stale ``[c0, ret)``
+    locks have to go first or their refcount leaks -- and read locks are
+    shared across prefix-sharing requests, so a leak corrupts other requests.
+    The release must be the blocking variant: ``LOOKUP`` and
+    ``FREE_LOOKUP_LOCKS`` share the normal thread pool, so a fire-and-forget
+    release can land after the replacement's ``begin_lookup`` has already
+    reset the session state.
+    """
+    cls, connector, adapter, request, tracker = _shrink_connector()
+    adapter.check_lookup_result.return_value = 6 * CHUNK_SIZE
+    tracker.lookup_covered_tokens = 4 * CHUNK_SIZE
+    tracker.num_vllm_hit_tokens = 2 * CHUNK_SIZE  # APC shrank below the boundary
+    tracker.num_stored_tokens = 6 * CHUNK_SIZE
+    tracker.num_lmcache_hit_tokens = 6 * CHUNK_SIZE
+
+    result = cls._handle_covered_shrink(connector, request, tracker)
+
+    # Scheduler is told to re-poll rather than given a hit length.
+    assert result == (None, True)
+    # Released through the blocking variant, over the whole hit range.
+    adapter.free_lookup_locks_blocking.assert_called_once()
+    assert adapter.free_lookup_locks_blocking.call_args.kwargs["start"] == 0
+    assert adapter.free_lookup_locks_blocking.call_args.kwargs["end"] == 6 * CHUNK_SIZE
+    adapter.free_lookup_locks.assert_not_called()
+    adapter.cleanup_lookup_result.assert_called_once_with(request.request_id)
+    # Sticky, so a second shrink cannot recur for this request.
+    assert tracker.covered_skip_disabled is True
+    # Per-lookup state reset so the next poll submits a fresh full lookup.
+    assert tracker.lookup_covered_tokens == 0
+    assert tracker.lookup_started_at is None
+    assert tracker.num_stored_tokens == 0
+    assert tracker.num_lmcache_hit_tokens == 0
+
+
+def test_no_shrink_when_apc_hit_still_covers_the_boundary():
+    """An APC hit at or above the frozen boundary is not a shrink."""
+    cls, connector, adapter, request, tracker = _shrink_connector()
+    adapter.check_lookup_result.return_value = 6 * CHUNK_SIZE
+    tracker.lookup_covered_tokens = 4 * CHUNK_SIZE
+    tracker.num_vllm_hit_tokens = 4 * CHUNK_SIZE  # exactly at the boundary
+
+    assert cls._handle_covered_shrink(connector, request, tracker) is None
+    adapter.free_lookup_locks_blocking.assert_not_called()
+    assert tracker.covered_skip_disabled is False
+    assert tracker.lookup_covered_tokens == 4 * CHUNK_SIZE
+
+
+def test_shrink_is_inert_when_the_skip_is_disabled():
+    """With the flag off, or once sticky, the hook must do nothing.
+
+    ``covered_skip_disabled`` is what makes the fallback fire only once; if
+    the hook still acted on a disabled request it would free locks the
+    replacement full lookup legitimately holds.
+    """
+    cls, connector, adapter, request, tracker = _shrink_connector(skip_enabled=False)
+    adapter.check_lookup_result.return_value = 6 * CHUNK_SIZE
+    tracker.lookup_covered_tokens = 4 * CHUNK_SIZE
+    tracker.num_vllm_hit_tokens = 0  # would be a shrink if the flag were on
+
+    assert cls._handle_covered_shrink(connector, request, tracker) is None
+    adapter.free_lookup_locks_blocking.assert_not_called()
+
+    # Same once the request has already fallen back: boundary reset to 0.
+    cls2, connector2, adapter2, request2, tracker2 = _shrink_connector()
+    adapter2.check_lookup_result.return_value = 6 * CHUNK_SIZE
+    tracker2.covered_skip_disabled = True
+    tracker2.lookup_covered_tokens = 0
+    tracker2.num_vllm_hit_tokens = 0
+
+    assert cls2._handle_covered_shrink(connector2, request2, tracker2) is None
+    adapter2.free_lookup_locks_blocking.assert_not_called()
